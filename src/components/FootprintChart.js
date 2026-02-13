@@ -140,6 +140,25 @@ export class FootprintChart {
     updateCandles(candles) {
         this.candles = candles || [];
 
+        // Debug log
+        if (this.candles.length > 0) {
+            const firstCandle = this.candles[0];
+            const hasClusters = firstCandle.clusters && (
+                (firstCandle.clusters instanceof Map && firstCandle.clusters.size > 0) ||
+                (typeof firstCandle.clusters === 'object' && Object.keys(firstCandle.clusters).length > 0)
+            );
+            console.log(`🕯️ FootprintChart received ${this.candles.length} candles, first has clusters:`, hasClusters);
+            if (firstCandle) {
+                console.log(`   First candle:`, {
+                    time: firstCandle.time,
+                    open: firstCandle.open,
+                    close: firstCandle.close,
+                    volume: firstCandle.volume,
+                    clusters: firstCandle.clusters ? Object.keys(firstCandle.clusters).length + ' price levels' : 'EMPTY',
+                });
+            }
+        }
+
         // PRE-CALCULATE CVD
         let runningDelta = 0;
         for (const c of this.candles) {
@@ -274,16 +293,32 @@ export class FootprintChart {
         const map = new Map();
         let maxVol = 0;
         let poc = 0;
+        let clusterCount = 0;
 
         for (const c of this.candles) {
-            if (!c.clusters) continue;
+            if (!c.clusters) {
+                console.warn('⚠️ Candle has no clusters property:', c);
+                continue;
+            }
 
             // Handle both Map and Object formats
             let entries = [];
-            if (c.clusters instanceof Map) entries = c.clusters.entries();
-            else entries = Object.entries(c.clusters).map(([p, d]) => [parseFloat(p), d]);
+            if (c.clusters instanceof Map) {
+                entries = Array.from(c.clusters.entries());
+            } else if (typeof c.clusters === 'object') {
+                entries = Object.entries(c.clusters);
+            } else {
+                console.warn('⚠️ Clusters is neither Map nor Object:', typeof c.clusters, c.clusters);
+                continue;
+            }
+
+            if (entries.length === 0) {
+                console.warn('⚠️ Candle has empty clusters');
+                continue;
+            }
 
             for (const [price, data] of entries) {
+                clusterCount++;
                 const vol = (data.bid || 0) + (data.ask || 0);
                 const current = map.get(price) || 0;
                 const next = current + vol;
@@ -295,6 +330,8 @@ export class FootprintChart {
                 }
             }
         }
+
+        console.log(`📈 SessionProfile: ${clusterCount} total cluster entries from ${this.candles.length} candles`);
 
         // Convert to array for rendering
         this.sessionProfile = Array.from(map.entries())
@@ -740,7 +777,55 @@ export class FootprintChart {
 
     _drawCandles(ctx) {
         const { candles, zoomX, zoomY, offsetX, width, height } = this;
-        if (!candles || candles.length === 0) return;
+        if (!candles || candles.length === 0) {
+            // Debug: No candles to draw
+            ctx.fillStyle = '#404040';
+            ctx.font = '12px monospace';
+            ctx.fillText('Waiting for candle data...', 20, 30);
+            return;
+        }
+
+        // Check if candles have clusters
+        const candlesWithClusters = candles.filter(c => c.clusters && (
+            (c.clusters instanceof Map && c.clusters.size > 0) ||
+            (typeof c.clusters === 'object' && Object.keys(c.clusters).length > 0)
+        ));
+
+        if (candlesWithClusters.length === 0) {
+            // Debug: All candles empty
+            ctx.fillStyle = '#404040';
+            ctx.font = '12px monospace';
+            ctx.fillText(`${candles.length} candles loaded but no cluster data...`, 20, 30);
+            console.warn('⚠️ All candles have empty clusters!');
+            
+            // Still draw simple OHLC candles
+            const startIdx = Math.max(0, Math.floor(-offsetX / zoomX) - 1);
+            const endIdx = Math.min(candles.length - 1, Math.ceil((width - offsetX) / zoomX) + 1);
+            const candleWidth = Math.max(1, zoomX - 4);
+
+            for (let i = startIdx; i <= endIdx; i++) {
+                const c = candles[i];
+                if (!c) continue;
+
+                const x = this._getX(i);
+                const bull = c.close >= c.open;
+
+                // Draw simple candle
+                ctx.strokeStyle = bull ? this.colors.candleUp : this.colors.candleDown;
+                const centerX = Math.floor(x + candleWidth / 2) + 0.5;
+
+                ctx.beginPath();
+                ctx.moveTo(centerX, this._getY(c.high));
+                ctx.lineTo(centerX, this._getY(c.low));
+                ctx.stroke();
+
+                const openY = this._getY(c.open);
+                const closeY = this._getY(c.close);
+                ctx.fillStyle = bull ? this.colors.candleUp : this.colors.candleDown;
+                ctx.fillRect(x, Math.min(openY, closeY), candleWidth, Math.abs(openY - closeY) || 1);
+            }
+            return;
+        }
 
         const startIdx = Math.max(0, Math.floor(-offsetX / zoomX) - 1);
         const endIdx = Math.min(candles.length - 1, Math.ceil((width - offsetX) / zoomX) + 1);

@@ -24,26 +24,48 @@ export async function fetchHistoricalTrades(symbol, limit = 1000, startTime = nu
 
     const url = `${BINANCE_FUTURES_API}/fapi/v1/aggTrades?${params}`;
 
-    try {
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Binance API error: ${response.status}`);
+    // Retry logic with exponential backoff
+    const maxRetries = 3;
+    let lastError;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+
+            const response = await fetch(url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+                throw new Error(`Binance API error: ${response.status} ${response.statusText}`);
+            }
+
+            const data = await response.json();
+
+            // Transform to our trade format
+            return data.map(trade => ({
+                price: parseFloat(trade.p),
+                quantity: parseFloat(trade.q),
+                time: trade.T,
+                isBuyerMaker: trade.m,
+                tradeId: trade.a
+            }));
+        } catch (error) {
+            lastError = error;
+            console.warn(`⚠️ Attempt ${attempt + 1}/${maxRetries} failed:`, error.message);
+            
+            // Only retry on network errors, not on 404 or other status codes
+            if (attempt < maxRetries - 1 && (error.name === 'AbortError' || !error.message.includes('400'))) {
+                // Wait before retrying (exponential backoff)
+                await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+            } else {
+                break;
+            }
         }
-
-        const data = await response.json();
-
-        // Transform to our trade format
-        return data.map(trade => ({
-            price: parseFloat(trade.p),
-            quantity: parseFloat(trade.q),
-            time: trade.T,
-            isBuyerMaker: trade.m,
-            tradeId: trade.a
-        }));
-    } catch (error) {
-        console.error('Failed to fetch historical trades:', error);
-        throw error;
     }
+
+    console.error('Failed to fetch historical trades after retries:', lastError);
+    throw lastError;
 }
 
 /**
@@ -60,14 +82,24 @@ export async function fetchTradesForPeriod(symbol, minutes = 10, onProgress = nu
     const allTrades = [];
     let currentEndTime = endTime;
     let batchCount = 0;
-    const maxBatches = 20; // Maximum batches to prevent infinite loops
+    const maxBatches = 20;
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 3;
 
-
-    while (currentEndTime > startTime && batchCount < maxBatches) {
+    while (currentEndTime > startTime && batchCount < maxBatches && consecutiveErrors < maxConsecutiveErrors) {
         try {
             const trades = await fetchHistoricalTrades(symbol, 1000, null, currentEndTime);
 
-            if (trades.length === 0) break;
+            if (trades.length === 0) {
+                consecutiveErrors++;
+                if (consecutiveErrors >= maxConsecutiveErrors) {
+                    console.warn('⚠️ No more trades available, stopping');
+                    break;
+                }
+                continue;
+            }
+
+            consecutiveErrors = 0; // Reset error counter on success
 
             // Filter trades within our time range
             const validTrades = trades.filter(t => t.time >= startTime);
@@ -80,9 +112,12 @@ export async function fetchTradesForPeriod(symbol, minutes = 10, onProgress = nu
                 onProgress(progress);
             }
 
-            // Get oldest trade time for next batch
+            // Check if we've reached our time window
             const oldestTrade = trades[trades.length - 1];
-            if (oldestTrade.time <= startTime) break;
+            if (oldestTrade.time <= startTime) {
+                console.log(`✅ Reached start time boundary`);
+                break;
+            }
 
             currentEndTime = oldestTrade.time - 1;
 
@@ -90,16 +125,23 @@ export async function fetchTradesForPeriod(symbol, minutes = 10, onProgress = nu
             await new Promise(resolve => setTimeout(resolve, 500));
 
         } catch (error) {
-            // On ANY error (including rate limit), stop immediately and return what we have
-            console.warn('⚠️ Error fetching trades, stopping with partial data:', error.message);
-            break;
+            consecutiveErrors++;
+            console.warn(`⚠️ Error fetching batch ${batchCount + 1}:`, error.message);
+            
+            if (consecutiveErrors >= maxConsecutiveErrors) {
+                console.warn('⚠️ Max retries exceeded, stopping with partial data');
+                break;
+            }
+            
+            // Add delay before retry
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
     }
 
     // Sort by time ascending
     allTrades.sort((a, b) => a.time - b.time);
 
-
+    console.log(`📊 Fetched total of ${allTrades.length} trades in ${batchCount} batches`);
     return allTrades;
 }
 

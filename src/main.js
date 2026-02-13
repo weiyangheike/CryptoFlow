@@ -5,7 +5,7 @@
 
 import { binanceWS } from './services/binanceWS.js';
 import { dataAggregator } from './services/dataAggregator.js';
-import { fetchTradesForPeriod } from './services/binanceREST.js';
+import { fetchTradesForPeriod, fetchHistoricalKlines } from './services/binanceREST.js';
 import { settingsManager } from './services/settingsManager.js';
 import { audioService } from './services/audioService.js';
 import { sessionManager } from './services/sessionManager.js';
@@ -470,6 +470,7 @@ class CryptoFlowApp {
     _setupWebSocket() {
         // Connection status
         binanceWS.on('connect', ({ symbol }) => {
+            console.log(`✅ WebSocket connected for ${symbol || 'unknown'}`);
             this.elements.connectionStatus.classList.add('connected');
             this.elements.connectionStatus.querySelector('.status-text').textContent = 'Connected';
             // Hide loading overlay
@@ -477,6 +478,7 @@ class CryptoFlowApp {
         });
 
         binanceWS.on('disconnect', () => {
+            console.log('❌ WebSocket disconnected');
             this.elements.connectionStatus.classList.remove('connected');
             this.elements.connectionStatus.querySelector('.status-text').textContent = 'Disconnected';
         });
@@ -502,7 +504,14 @@ class CryptoFlowApp {
             }
 
             // Process trade in aggregator
+            const candlesBefore = dataAggregator.getCandles().length;
             dataAggregator.processTrade(trade);
+            const candlesAfter = dataAggregator.getCandles().length;
+            
+            // Debug: Log candle creation
+            if (candlesAfter > candlesBefore || (candlesAfter === 0 && dataAggregator.currentCandle)) {
+                console.log(`🕯️ Candle Update: ${candlesAfter} closed candles, current candle exists:`, !!dataAggregator.currentCandle);
+            }
         });
 
         // Depth data (throttled for performance)
@@ -540,6 +549,7 @@ class CryptoFlowApp {
 
         // Data aggregator events
         dataAggregator.on('candleUpdate', () => {
+            console.log('🔄 candleUpdate event triggered');
             this._updateCharts();
 
             // Update Market Analysis panel
@@ -604,85 +614,152 @@ class CryptoFlowApp {
         }
 
         // Load historical data - try VPS candles first (faster), then Binance trades fallback
+        let dataLoaded = false;
+        
         try {
             this._updateLoadingText('Connecting to VPS...');
 
             // Try to get pre-aggregated candles from VPS (much faster than raw trades)
-            let vpsAvailable = false;
-
             try {
-                // Load ALL available candles (max 1500)
                 const candlesNeeded = 1500;
+                const vpsCandles = await vpsAPI.getCandles(symbol, this.currentTimeframe, candlesNeeded);
 
-                try {
-                    const vpsCandles = await vpsAPI.getCandles(symbol, this.currentTimeframe, candlesNeeded);
+                if (vpsCandles && vpsCandles.length > 0) {
+                    this._updateLoadingText(`✅ VPS: Importing ${vpsCandles.length} candles...`);
+                    await new Promise(r => setTimeout(r, 300));
 
-                    if (vpsCandles && vpsCandles.length > 0) {
-                        this._updateLoadingText(`✅ VPS: Importing ${vpsCandles.length} candles...`);
-                        await new Promise(r => setTimeout(r, 500)); // Show success briefly
-
-                        dataAggregator.importCandles(vpsCandles);
-                        vpsAvailable = true;
-
-                        // Update charts immediately
-                        this._updateCharts();
-                    } else {
-                        throw new Error('VPS returned 0 candles');
-                    }
-                } catch (apiErr) {
-                    console.error('VPS API fetch failed:', apiErr);
-                    this._updateLoadingText(`⚠️ VPS Error: ${apiErr.message}`);
-                    await new Promise(r => setTimeout(r, 1000)); // Show error
-                    throw apiErr;
+                    dataAggregator.reset();
+                    dataAggregator.importCandles(vpsCandles);
+                    this._updateCharts();
+                    dataLoaded = true;
+                    console.log(`✅ Successfully loaded ${vpsCandles.length} candles from VPS`);
+                } else {
+                    console.warn('⚠️ VPS returned empty candles array');
                 }
             } catch (vpsError) {
-                this._updateLoadingText('⚠️ VPS failed. Trying Binance...');
-
+                console.warn('VPS API failed, falling back to Binance:', vpsError.message);
             }
 
-            // Fallback to Binance raw trades if VPS didn't work
-            if (!vpsAvailable) {
-                this._updateLoadingText('Fetching historical trades from Binance...');
+            // Fallback to Binance raw trades if VPS didn't provide data
+            if (!dataLoaded) {
+                this._updateLoadingText('📊 Fetching from Binance...');
 
-                // Scale history based on timeframe (e.g. 1h needs more history than 1m)
-                let minutesToLoad = this.historyMinutes;
-                if (this.currentTimeframe === 5) minutesToLoad = 60;
-                if (this.currentTimeframe === 15) minutesToLoad = 120;
-                if (this.currentTimeframe === 60) minutesToLoad = 240; // 4 hours
+                try {
+                    // Scale history based on timeframe
+                    let minutesToLoad = this.historyMinutes;
+                    if (this.currentTimeframe === 5) minutesToLoad = 60;
+                    if (this.currentTimeframe === 15) minutesToLoad = 120;
+                    if (this.currentTimeframe === 60) minutesToLoad = 240;
 
-                const trades = await fetchTradesForPeriod(
-                    symbol.toUpperCase(),
-                    minutesToLoad,
-                    (progress) => {
-                        this._updateLoadingText(`Fetching trades... ${progress}%`);
+                    console.log(`Fetching ${minutesToLoad} minutes of trades from Binance...`);
+
+                    const trades = await fetchTradesForPeriod(
+                        symbol.toUpperCase(),
+                        minutesToLoad,
+                        (progress) => {
+                            this._updateLoadingText(`Fetching... ${progress}%`);
+                        }
+                    );
+
+                    console.log(`Binance returned ${trades.length} trades`);
+
+                    // If we got trades, process them
+                    if (trades && trades.length > 0) {
+                        this._updateLoadingText(`Processing ${trades.length} trades...`);
+                        await new Promise(r => setTimeout(r, 100));
+
+                        // Reset dataAggregator for fresh processing
+                        dataAggregator.reset();
+                        dataAggregator.timeframe = this.currentTimeframe;
+                        
+                        dataAggregator.processHistoricalTrades(trades, (progress) => {
+                            this._updateLoadingText(`Processing... ${progress}%`);
+                        });
+
+                        this._updateCharts();
+                        dataLoaded = true;
+                        console.log(`✅ Successfully processed ${trades.length} trades from Binance`);
+                    } else {
+                        console.warn('⚠️ Binance trade API returned 0 trades, trying klines...');
+                        // Try klines as fallback
+                        try {
+                            const klineInterval = this._getKlineInterval(this.currentTimeframe);
+                            const klineLimit = Math.max(100, Math.ceil(minutesToLoad / this.currentTimeframe));
+                            
+                            this._updateLoadingText(`Trying Binance klines (${klineInterval})...`);
+                            const klines = await fetchHistoricalKlines(symbol.toUpperCase(), klineInterval, Math.min(1000, klineLimit));
+                            
+                            if (klines && klines.length > 0) {
+                                console.log(`📊 Got ${klines.length} klines from Binance`);
+                                this._updateLoadingText(`Processing ${klines.length} candles...`);
+                                
+                                // Convert klines to candle format with clusters
+                                const candles = klines.map(k => ({
+                                    time: k.time,
+                                    open: k.open,
+                                    high: k.high,
+                                    low: k.low,
+                                    close: k.close,
+                                    volume: k.volume,
+                                    buyVolume: k.takerBuyVolume || 0,
+                                    sellVolume: (k.volume - (k.takerBuyVolume || 0)) || 0,
+                                    delta: (k.takerBuyVolume || 0) - ((k.volume - (k.takerBuyVolume || 0)) || 0),
+                                    tradeCount: k.trades || 0,
+                                    clusters: {}
+                                }));
+                                
+                                dataAggregator.reset();
+                                dataAggregator.importCandles(candles);
+                                this._updateCharts();
+                                dataLoaded = true;
+                                console.log(`✅ Successfully loaded ${candles.length} candles from Binance klines`);
+                            }
+                        } catch (klinesError) {
+                            console.warn('Klines fallback also failed:', klinesError.message);
+                        }
                     }
-                );
-
-                if (trades.length > 0) {
-                    this._updateLoadingText(`Processing ${trades.length} trades...`);
-                    await new Promise(r => setTimeout(r, 50));
-
-                    dataAggregator.timeframe = this.currentTimeframe; // Ensure correct mode
-                    dataAggregator.processHistoricalTrades(trades, (progress) => {
-                        this._updateLoadingText(`Processing trades... ${progress}%`);
-                    });
-
+                } catch (binanceError) {
+                    console.error('Binance fallback failed:', binanceError);
+                    this._updateLoadingText('⚠️ Unable to load historical data');
+                }
+                
+                // If still no data, initialize empty for live trading
+                if (!dataLoaded) {
+                    console.log('⚠️ No historical data loaded, initializing for live trading');
+                    dataAggregator.reset();
+                    dataAggregator.timeframe = this.currentTimeframe;
                     this._updateCharts();
-                } else {
-                    this._updateLoadingText('⚠️ No trades found.');
                 }
             }
         } catch (error) {
-            console.error('Failed to load historical data:', error);
-            // Continue anyway with live data
+            console.error('Unexpected error during data loading:', error);
         }
 
         // ALWAYS hide loading overlay after processing
         this.elements.loadingOverlay.classList.add('hidden');
 
+        // Debug: Check current state
+        const candlesCount = dataAggregator.getCandles().length;
+        const volumeProfileSize = dataAggregator.getVolumeProfile().profile?.length || 0;
+        console.log(`📊 After data loading: ${candlesCount} candles, ${volumeProfileSize} volume profile points`);
+
         // Connect WebSocket
         this._updateLoadingText('Connecting to live feed...');
+        console.log(`🔗 Subscribing to ${symbol}...`);
         binanceWS.subscribe(symbol);
+    }
+
+    /**
+     * Convert timeframe to Binance kline interval
+     * @param {number} minutes - Timeframe in minutes
+     * @returns {string} - Binance kline interval (e.g., '1m', '5m')
+     */
+    _getKlineInterval(minutes) {
+        if (minutes === 1) return '1m';
+        if (minutes === 5) return '5m';
+        if (minutes === 15) return '15m';
+        if (minutes === 60) return '1h';
+        return '1m'; // Default
     }
 
     /**
@@ -772,6 +849,28 @@ class CryptoFlowApp {
         const candles = dataAggregator.getCandles();
         const volumeProfile = dataAggregator.getVolumeProfile();
         const sessionMarkers = dataAggregator.getSessionMarkers();
+
+        // Debug logging
+        if (candles.length > 0) {
+            const candleWithClusters = candles.filter(c => 
+                c.clusters && (
+                    (c.clusters instanceof Map && c.clusters.size > 0) ||
+                    (typeof c.clusters === 'object' && Object.keys(c.clusters).length > 0)
+                )
+            );
+            console.log(`📊 _updateCharts: ${candles.length} total candles, ${candleWithClusters.length} have clusters`);
+            
+            // Check first candle structure
+            if (candles[0]) {
+                console.log(`   First candle structure:`, {
+                    hasTime: !!candles[0].time,
+                    hasOpen: !!candles[0].open,
+                    hasClusters: !!candles[0].clusters,
+                    clustersType: typeof candles[0].clusters,
+                    clustersSize: candles[0].clusters instanceof Map ? candles[0].clusters.size : Object.keys(candles[0].clusters || {}).length
+                });
+            }
+        }
 
         this.footprintChart.updateCandles(candles);
         this.footprintChart.updateSessionMarkers(sessionMarkers);

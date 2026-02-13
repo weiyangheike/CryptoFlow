@@ -243,6 +243,11 @@ export class DataAggregator {
         // Update current candle
         this._updateCandle(roundedPrice, quantity, isBuy, price);
 
+        // Debug: Check if currentCandle has clusters
+        if (this.currentCandle && this.currentCandle.clusters && this.currentCandle.clusters.size > 0) {
+            console.log(`✅ CurrentCandle clusters updated: ${this.currentCandle.clusters.size} price levels`);
+        }
+
         // Emit stats update
         this._emit('statsUpdate', this.getStats());
     }
@@ -647,19 +652,29 @@ export class DataAggregator {
     getCandles() {
         // Convert all candles to have clusters as Objects (not Maps)
         // FootprintChart._renderCandle uses Object.keys() which doesn't work on Maps
-        const allCandles = this.candles.map(candle => ({
-            ...candle,
-            clusters: candle.clusters instanceof Map
+        const allCandles = this.candles.map(candle => {
+            const clustersObj = candle.clusters instanceof Map
                 ? Object.fromEntries(candle.clusters)
-                : candle.clusters
-        }));
+                : candle.clusters;
+            return {
+                ...candle,
+                clusters: clustersObj
+            };
+        });
 
         if (this.currentCandle) {
+            const currentClusters = this.currentCandle.clusters instanceof Map
+                ? Object.fromEntries(this.currentCandle.clusters)
+                : this.currentCandle.clusters;
+            
+            // Debug
+            if (currentClusters && Object.keys(currentClusters).length > 0) {
+                console.log(`📦 Current candle has ${Object.keys(currentClusters).length} price levels`);
+            }
+            
             allCandles.push({
                 ...this.currentCandle,
-                clusters: this.currentCandle.clusters instanceof Map
-                    ? Object.fromEntries(this.currentCandle.clusters)
-                    : this.currentCandle.clusters
+                clusters: currentClusters
             });
         }
         return allCandles;
